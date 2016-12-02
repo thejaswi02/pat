@@ -4,9 +4,12 @@
 import re
 import sys
 
+from subprocess import run, PIPE
 from argparse import ArgumentParser, FileType
 from collections import defaultdict
 from difflib import SequenceMatcher
+from pithy.io import failF
+from pithy.seq import group_seq_by_heads, HeadlessMode
 
 
 __all__ = ['pat_dependencies', 'main']
@@ -24,10 +27,27 @@ def main():
   subs.required = True # unofficial workaround.
   subs.dest = 'command' # this is necessary to make `required` above work.
 
-  sub_diff = subs.add_parser('diff',
+  sub_gitdiff = subs.add_parser('gitdiff',
     help='create .pat style diff between two existing source files.')
 
-  sub_diff.set_defaults(handler=main_diff)
+  sub_gitdiff.set_defaults(handler=main_diff)
+
+  sub_gitdiff.add_argument('original', type=FileType('r'),
+    help='source file to use as the basis (left/minus side) of the patch.')
+
+  sub_gitdiff.add_argument('modified', type=FileType('r'),
+    help='source file to use as the modification (right/plus side) from which to calculate the patch.')
+
+  sub_gitdiff.add_argument('destination', nargs='?', type=FileType('w'), default='-',
+    help='output path (defaults to stdout)')
+
+  sub_gitdiff.add_argument('-min-context', type=int, default=3,
+    help='minimum number of lines of context to show before each hunk.')
+
+  sub_diff = subs.add_parser('gitdiff',
+    help='create .pat style diff between two existing source files.')
+
+  sub_diff.set_defaults(handler=main_gitdiff)
 
   sub_diff.add_argument('original', type=FileType('r'),
     help='source file to use as the basis (left/minus side) of the patch.')
@@ -55,6 +75,98 @@ def main():
   args = parser.parse_args()
   args.handler(args)
 
+def get_matches(s, hunk_start, hunk_end, origLines):
+  matches=[]
+  s.set_seq1(origLines[hunk_start:hunk_end])
+  for match in s.get_matching_blocks():
+    i, j, n = match
+    if (n == hunk_end - hunk_start):
+      matches.append(match)
+  return matches
+
+# Inefficient, change to add up indices of multiple matching blocks when they overlap
+def get_hunk_context(s, hunk_start, hunk_end, origLines):
+  #print("Hunk Start", hunk_start)
+  #print("Hunk End", hunk_end)
+  #Check first time if the hunk is unique 
+  matches=get_matches(s, hunk_start, hunk_end, origLines)
+  while len(matches) > 1:
+    if hunk_start > 0:
+      hunk_start = hunk_start - 1
+    else:
+      return hunk_start, hunk_end
+    matches=get_matches(s, hunk_start, hunk_end, origLines)
+  return hunk_start, hunk_end
+
+def main_gitdiff(args):
+  original = args.original
+  modified = args.modified
+  f_out = args.destination
+  min_context = args.min_context
+
+  if original.name.find('..') != -1:
+    failF("original path cannot contain '..': {!r}", original.name)
+
+  origLines = original.readlines()
+
+  s = SequenceMatcher(None)
+  s.set_seq2(origLines)
+
+  out = sys.stdout # get the buffer.
+  cmd = 'git diff --exit-code --no-index --no-color --histogram --unified=0'.split() 
+  cmd.append(original.name)
+  cmd.append(modified.name)
+  sub = run(cmd, stdout=PIPE, universal_newlines=True)
+  if sub.returncode not in (0, 1):
+    failF('pat: git diff failed with status code: {}.', sub.returncode)
+  out.write('pat v0\n')
+
+  groups = group_seq_by_heads(seq=sub.stdout.splitlines(True),
+    is_head=lambda line: line.startswith('@@'),
+    headless=HeadlessMode.drop)
+
+  # print("Number of groups",len(groups))
+  for group in groups:
+    # out.write('Group\n')
+    head = group[0]
+    a = re.search('-.*\+', str(head)).group(0)
+    # out.write('Start line: ')
+
+    # Array index starts with 0 git diff is with 1
+    start_line_num = a[1:a.find(',')]
+    # out.write(start_line_num.encode('ascii') + '\n'.encode('ascii'))
+    start_line_num = int(a[1:a.find(',')])
+
+    # Special case when start line number from git diff is 0. Its always a line added in the begining
+    if(start_line_num == 0):
+      hunk_start = start_line_num
+      hunk_end = start_line_num
+    else:
+      start_line_num = start_line_num - 1
+      hunk_start = start_line_num - min_context
+      if hunk_start < 0:
+        hunk_start = 0
+      hunk_end = start_line_num
+
+      #out.write("Hunk Start"), hunk_start)
+      #print("Hunk End", hunk_end)
+      hunk_start, hunk_end = get_hunk_context(s, hunk_start, hunk_end, origLines) 
+
+    if hunk_start == 0:
+      out.write('|^\n')
+    for line in origLines[hunk_start:hunk_end]:
+      out.write('| ')
+      out.write(line)
+      
+    for line in group[1:]:
+      if line.startswith('-'):
+        out.write('- ')
+        out.write(line[1:])
+      elif line.startswith('+'):
+        out.write('+ ')
+        out.write(line[1:])
+      else:
+        failF('invalid line in diff output: {!r}', line)
 
 def main_diff(args):
   'diff command entry point.'
@@ -178,8 +290,8 @@ def main_apply(args):
   f_patch = args.patch
   f_out = args.destination
 
-  def patch_failF(line_num, fmt, *items):
-    failF('{}:{}: ' + fmt, f_patch.name, line_num + 1, *items)
+  def patch_failF(startline_num, fmt, *items):
+    failF('{}:{}: ' + fmt, f_patch.name, start_line_num + 1, *items)
 
   version_line = f_patch.readline()
   orig_line = f_patch.readline()
